@@ -7,18 +7,20 @@ import { fileURLToPath } from "url";
 const app = express();
 app.use(express.json());
 
-/* ---------------- GLOBAL STATE ---------------- */
+/* ================= GLOBAL CONFIG ================= */
+
+const MAX_PROVIDERS_PER_ROUND = 2;
+const ROUND_TIMEOUT_MS = 15000;
+const PROVIDER_TIMEOUT_MS = 12000;
+const ROUND_DURATION_MIN = 5;
+
+/* ================= STATE ================= */
 
 const providers = new Map();
-
 let currentRound = 1;
 let roundActive = false;
 
-const ROUND_TIMEOUT_MS = 15000; // round duration
-const AGGREGATION_DELAY_MS = 2000; // wait for uploads to finish
-const PROVIDER_TIMEOUT_MS = 12000; // offline if no heartbeat
-
-/* ---------------- PATH SETUP ---------------- */
+/* ================= PATH SETUP ================= */
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -32,7 +34,7 @@ const PROVIDER_UPDATES_DIR = path.join(STORAGE_DIR, "provider-updates");
 fs.mkdirSync(GLOBAL_MODEL_DIR, { recursive: true });
 fs.mkdirSync(PROVIDER_UPDATES_DIR, { recursive: true });
 
-/* ---------------- MODEL INIT ---------------- */
+/* ================= MODEL INIT ================= */
 
 function initGlobalModel() {
   const modelPath = path.join(GLOBAL_MODEL_DIR, "round-0.pt");
@@ -44,13 +46,63 @@ function initGlobalModel() {
 
 initGlobalModel();
 
-/* ---------------- ROUND LOGIC ---------------- */
+/* ================= UTILS ================= */
+
+function gpuPowerScore(gpu) {
+  if (!gpu) return 0.5;
+  if (gpu.includes("4090")) return 1.0;
+  if (gpu.includes("3080")) return 0.8;
+  if (gpu.includes("3060")) return 0.6;
+  return 0.5;
+}
+
+/* ================= SCHEDULER ================= */
+
+function selectProvidersForRound() {
+  const now = Date.now();
+
+  const eligible = Array.from(providers.values()).filter((p) => {
+    return p.status === "IDLE" && now - p.lastSeen < PROVIDER_TIMEOUT_MS;
+  });
+
+  eligible.forEach((p) => {
+    const gpuScore = gpuPowerScore(p.gpu);
+    const availabilityFactor = Math.min(
+      (p.availabilityMinutes || ROUND_DURATION_MIN) / ROUND_DURATION_MIN,
+      1.0
+    );
+
+    p.scheduleScore = p.reliabilityScore * gpuScore * availabilityFactor;
+  });
+
+  eligible.sort((a, b) => b.scheduleScore - a.scheduleScore);
+
+  return eligible.slice(0, MAX_PROVIDERS_PER_ROUND);
+}
+
+/* ================= ROUND LOOP ================= */
 
 function startRound() {
   if (roundActive) return;
 
+  const selected = selectProvidersForRound();
+
+  if (selected.length === 0) {
+    console.log("No providers available for round", currentRound);
+    setTimeout(startRound, 3000);
+    return;
+  }
+
   roundActive = true;
-  console.log(`Round ${currentRound} started`);
+  console.log(
+    `Round ${currentRound} started with providers:`,
+    selected.map((p) => p.providerId)
+  );
+
+  selected.forEach((p) => {
+    p.status = "BUSY";
+    p.lastScheduledAt = Date.now();
+  });
 
   setTimeout(endRound, ROUND_TIMEOUT_MS);
 }
@@ -58,31 +110,16 @@ function startRound() {
 function endRound() {
   console.log(`Round ${currentRound} timeout reached`);
 
-  const roundToAggregate = currentRound;
+  spawn("python", [
+    "src/models/aggregate.py",
+    GLOBAL_MODEL_DIR,
+    PROVIDER_UPDATES_DIR,
+    currentRound.toString(),
+  ]);
 
-  // delay aggregation to avoid race condition
-  setTimeout(() => {
-    const py = spawn("python", [
-      "src/models/aggregate.py",
-      GLOBAL_MODEL_DIR,
-      PROVIDER_UPDATES_DIR,
-      roundToAggregate.toString(),
-    ]);
-
-    py.stdout.on("data", (d) => console.log("[AGG]", d.toString().trim()));
-    py.stderr.on("data", (d) =>
-      console.error("[AGG ERR]", d.toString().trim())
-    );
-
-    // cleanup provider updates for this round
-    py.on("close", () => {
-      for (const f of fs.readdirSync(PROVIDER_UPDATES_DIR)) {
-        if (f.startsWith(`round-${roundToAggregate}-`)) {
-          fs.unlinkSync(path.join(PROVIDER_UPDATES_DIR, f));
-        }
-      }
-    });
-  }, AGGREGATION_DELAY_MS);
+  for (const p of providers.values()) {
+    p.status = "IDLE";
+  }
 
   currentRound += 1;
   roundActive = false;
@@ -90,7 +127,19 @@ function endRound() {
   startRound();
 }
 
-/* ---------------- API ---------------- */
+/* ================= HEARTBEAT CLEANUP ================= */
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [id, p] of providers.entries()) {
+    if (now - p.lastSeen > PROVIDER_TIMEOUT_MS) {
+      console.log("Provider offline:", id);
+      providers.delete(id);
+    }
+  }
+}, 5000);
+
+/* ================= API ================= */
 
 app.get("/round/current", (req, res) => {
   res.json({ round: currentRound, active: roundActive });
@@ -99,13 +148,8 @@ app.get("/round/current", (req, res) => {
 app.get("/model/latest", (req, res) => {
   const files = fs
     .readdirSync(GLOBAL_MODEL_DIR)
-    .filter((f) => f.startsWith("round-"));
-
-  if (files.length === 0) {
-    return res.status(404).json({ error: "No model found" });
-  }
-
-  files.sort((a, b) => parseInt(b.split("-")[1]) - parseInt(a.split("-")[1]));
+    .filter((f) => f.startsWith("round-"))
+    .sort((a, b) => parseInt(b.split("-")[1]) - parseInt(a.split("-")[1]));
 
   res.sendFile(path.join(GLOBAL_MODEL_DIR, files[0]));
 });
@@ -113,16 +157,15 @@ app.get("/model/latest", (req, res) => {
 app.post("/provider/register", (req, res) => {
   const { providerId, gpu, vram, availabilityMinutes } = req.body;
 
-  if (!providerId) {
-    return res.status(400).json({ error: "providerId required" });
-  }
-
   providers.set(providerId, {
     providerId,
     gpu: gpu || "unknown",
     vram: vram || 0,
-    availabilityMinutes: availabilityMinutes || 0,
+    availabilityMinutes: availabilityMinutes || ROUND_DURATION_MIN,
+    reliabilityScore: 1.0,
+    status: "IDLE",
     lastSeen: Date.now(),
+    lastScheduledAt: 0,
   });
 
   console.log("Provider registered:", providerId);
@@ -131,13 +174,10 @@ app.post("/provider/register", (req, res) => {
 
 app.post("/provider/heartbeat", (req, res) => {
   const { providerId } = req.body;
+  const p = providers.get(providerId);
+  if (!p) return res.status(404).end();
 
-  const provider = providers.get(providerId);
-  if (!provider) {
-    return res.status(404).json({ error: "Provider not registered" });
-  }
-
-  provider.lastSeen = Date.now();
+  p.lastSeen = Date.now();
   res.json({ status: "alive" });
 });
 
@@ -145,38 +185,23 @@ app.post("/update", (req, res) => {
   const providerId = req.headers["x-provider-id"];
   const round = req.headers["x-round"];
 
-  const updatePath = path.join(
+  const filePath = path.join(
     PROVIDER_UPDATES_DIR,
     `round-${round}-${providerId}.pt`
   );
 
-  const stream = fs.createWriteStream(updatePath);
+  const stream = fs.createWriteStream(filePath);
   req.pipe(stream);
 
   stream.on("finish", () => {
-    console.log(`Update received from ${providerId} (round ${round})`);
+    console.log(`Update received from ${providerId} for round ${round}`);
     res.json({ status: "stored" });
   });
 });
 
-/* ---------------- OFFLINE DETECTION ---------------- */
-
-setInterval(() => {
-  const now = Date.now();
-
-  for (const [id, provider] of providers.entries()) {
-    if (now - provider.lastSeen > PROVIDER_TIMEOUT_MS) {
-      console.log(`Provider offline: ${id}`);
-      providers.delete(id);
-    }
-  }
-}, 5000);
-
-/* ---------------- START SERVER ---------------- */
+/* ================= START ================= */
 
 app.listen(7000, () => {
   console.log("Orchestrator running on port 7000");
-
-  // allow providers to register
   setTimeout(startRound, 3000);
 });
