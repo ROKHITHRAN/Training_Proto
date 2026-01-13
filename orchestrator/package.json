@@ -1,0 +1,9 @@
+{
+  "name": "orchestrator",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/api/model.js",
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
