@@ -4,6 +4,8 @@
   "type": "module",
   "main": "src/api/model.js",
   "dependencies": {
-    "express": "^4.19.2"
+    "axios": "^1.13.2",
+    "express": "^4.19.2",
+    "firebase-admin": "^13.6.0"
   }
 }
